@@ -23,9 +23,14 @@ Hardware:
 #define QMI_ADDR 0x6B 
 #define BME_ADDR 0x76
 
+//Other macro's
+#define SENSORREADTIME 1000//time in ms for sensor read interval
+
 //global variables
 float referancePressure;//variable used to set pressure referance for altitude
 float currentAltitude;//variable used to store the result of altitude calculation from pressure
+float currentTime;//current loop iteration time
+float lastSensorReadTime = 0;
 
 //global objects
 SensorQMI8658 qmi;
@@ -47,6 +52,14 @@ Function to get gyro and acc calibration data
 Function to initialise BME688
 ********************************************/
 bool initBME(void);
+/**************************************************
+Function to read altitude data into currentAltitude
+**************************************************/
+bool readAltitude(void);
+/*****************************
+Function to read gyro+acc data
+*****************************/
+bool readIMU(void);
 
 void setup() {
   //initialise serial communication
@@ -66,11 +79,16 @@ void setup() {
 
 void loop() {
 
-  //check if reading bme was successful
-  if(bme.performReading()){
-    currentAltitude =  bme.readAltitude(referancePressure);
-    Serial.printf("Altitude:%f m\n",currentAltitude);
-    Serial.printf("Temperature:%f *C\n",bme.readTemperature());
+  //time in ms since microcontroller turned on
+  currentTime = millis();
+
+  //check if its time to read sensor data
+  if(currentTime - lastSensorReadTime >= SENSORREADTIME){
+    if(!readAltitude()){
+      Serial.println("Error reading altitude!");
+    }
+
+    readIMU();
   }
 
 }
@@ -126,5 +144,36 @@ bool initBME(void){
   Serial.print("pressure referance: ");
   Serial.print(referancePressure);
   Serial.println(" hPa");
+  return true;
+}
+
+bool readAltitude(void){
+  //check if reading bme was successful
+  if(!bme.performReading()){
+    return false;
+  }
+  currentAltitude =  bme.readAltitude(referancePressure);
+  Serial.printf("Altitude:%f m\n",currentAltitude);
+  //Serial.printf("Temperature:%f *C\n",bme.readTemperature());
+  return true;
+}
+
+bool readIMU(){
+  
+  //check if the IMU data is not ready to read
+  if(!qmi.getDataReady){
+    Serial.println("IMU data is not ready to read!");
+    return false;
+  }
+
+  //check if accelerometer data is ready to read
+  if(!qmi.getAccelerometer(acc.x,acc.y,acc.z)){
+    Serial.println("Failed to retrieved accelerometer data!");
+  }
+
+  if(!qmi.getGyroscope(gyro.x,gyro.y,gyro.z)){
+    Serial.println("Failed to retrieve gyroscope data!");
+  }
+
   return true;
 }
