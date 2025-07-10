@@ -1,5 +1,5 @@
 /*
-  * Promgrammers: Matas Noreika, Luke Fleet, Natasha Palusinski, Enrique Sancho
+  * Programmers: Matas Noreika, Luke Fleet, Natasha Palusinski, Enrique Sancho
   * Date: Thu Jul 3 10:29:15 AM IST 2025
   * Purpose: Rocket application for sensate-x BIP
 
@@ -10,114 +10,7 @@ Hardware:
   * 1.14 inch TFT display (SPI) (Only for debugging)
 */
 
-//Macro to enable/disable serial prints & tft display
-#define DEBUG 1
-
-#include <Arduino.h>//core arduino library
-#include <Wire.h>//I2C library
-#include <SPI.h>//SPI library
-#include <SensorQMI8658.hpp>//QMI8658C library
-#include <Adafruit_BME680.h>//BME680-BME688 library
-
-#ifdef DEBUG
-  #include <Adafruit_ST7789.h>//TFT 1.14 inch library
-#endif 
-
-//Macro's for I2C
-#define I2C_SDA 42
-#define I2C_SCL 41
-
-#ifdef DEBUG
-  //Macro's for SPI
-  #define SPI_SCK 36
-  #define SPI_MISO 37
-  #define SPI_MOSI 35  
-  //Macro's defintions for TFT display
-  #define TFT_DC 39
-  #define TFT_CS 7
-  #define TFT_RST 40
-  #define TFT_BACKLIGHT 45
-#endif
-
-//Macro's for sensor Addresses
-#define QMI_ADDR 0x6B
-#define BME_ADDR 0x76
-
-//Other macro's
-#define SENSORREADTIME 1000.0//time in ms for sensor read interval
-#define CALIBRATIONTIME 2.0//time (s) for single calibration to occur
-#define CALIBRATIONSAMPLES 200//N samples to use for calibration
-#define GYRO_DEVIATION 5//the deviation for individual gyro measurement in degrees
-#define ACC_ANGLE_DEVIATION 2//the deviation for individual angle measurement from accelerometer in degrees
-
-//struct definition of sensorData
-struct SensorData {
-  float timestamp;
-  float altitude;
-  IMUdata acc;
-  IMUdata gyro;
-};
-
-//global variables
-float referancePressure;//variable used to set pressure referance for altitude
-float currentAltitude;//variable used to store the result of altitude calculation from pressure
-float currentTime;//current loop iteration time
-float lastSensorReadTime = 0;
-float kalman1DOutput[] = {0,0};//used to store the updated prediction and uncertainty
-float kalmanAngleRoll = 0,kalmanAnglePitch = 0, angleYaw = 0;
-float kalmanUncertaintyAnglePitch = 2*2,kalmanUncertaintyAngleRoll = 2*2;
-
-//global objects
-SensorQMI8658 qmi;
-IMUdata gyroCal,accCal;//gyro and accelerometer calibration data
-IMUdata gyro, acc;//gyro and acc data
-IMUdata accAngles;//angles calculated using accelerometer (only pitch and roll)
-Adafruit_BME680 bme(&Wire);
-SensorData sensorData;
-
-#ifdef DEBUG
-  Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);//object definition for tft display
-#endif
-//function prototypes
-/********************************************
-Function to initialise QMI8658C
-********************************************/
-bool initQMI(void);
-/********************************************
-Function to get gyro and acc calibration data
-********************************************/
-bool calibrateQMI();
-/********************************************
-Function to initialise BME688
-********************************************/
-bool initBME(void);
-/**************************************************
-Function to read altitude data into currentAltitude
-**************************************************/
-bool readAltitude(void);
-/*****************************
-Function to read gyro+acc data
-*****************************/
-bool readIMU(void);
-/**********************************************
-Function to perform kalman 1D operation on data
-**********************************************/
-void kalman_1d(float,float,float,float);
-/**************************************************************
-Function to use trigonometry to calculate pitch and roll angles
-**************************************************************/
-void calcAccAngles();
-
-#ifdef DEBUG
-  /*********************************
-  Function to initialise TFT display
-  *********************************/
-  bool initTFT(void);
-  /********************************
-  Function to print data out to TFT
-  ********************************/
-  void printDataTFT(SensorData& data);
-#endif
+#include "rocket_application.h"
 
 void setup() {
   
@@ -138,11 +31,20 @@ void setup() {
     while(1);
   }
 
+  //assign pre-calibrated accelerometer + gyroscope figures
+  accCal.x = -0.008762;
+  accCal.y = -0.064585;
+  accCal.z = -0.075341;
+  gyroCal.x = -4.297988;
+  gyroCal.y = 0.663027;
+  gyroCal.z = -0.635234;
+
   //initialise all sensors
   initQMI();
-  //delay(1);//add mini delay to prevent read fail
-  calibrateQMI();
   initBME();
+  init_nvs();
+  //set the pressure referance on start up
+  referancePressure = bme.readPressure()/100;
 }
 
 void loop() {
@@ -150,6 +52,11 @@ void loop() {
   //time in ms since microcontroller turned on
   currentTime = millis();
 
+  //check if the magnitude of acceleration reached greater than 4m/s^2
+  if(sensorData.accMag >= 5){
+    toggleSensorLogging = true;
+  }
+  
   //check if its time to read sensor data
   if(currentTime - lastSensorReadTime >= SENSORREADTIME){
     
@@ -158,12 +65,53 @@ void loop() {
 
     sensorData.timestamp = currentTime;
     sensorData.altitude = currentAltitude;
-    sensorData.acc = acc;
-    sensorData.gyro.x = kalmanAngleRoll;
-    sensorData.gyro.y = kalmanAnglePitch;
-    sensorData.gyro.z = angleYaw;
-    printDataTFT(sensorData);
+    sensorData.accMag = ((sqrt(acc.x*acc.x+acc.y*acc.y+acc.z*acc.z) -1) * 9.81) + 0.3;
+    sensorData.velocity += sensorData.accMag * (SENSORREADTIME/1000);
+    sensorData.roll = kalmanAngleRoll;
+    sensorData.pitch = kalmanAnglePitch;
+    sensorData.yaw = angleYaw;
+    
+    #ifdef DEBUG
+      printDataTFT(sensorData);
+    #endif
+
+    if(toggleSensorLogging){
+      //convert sensor struct to csv data line
+      sensor_data_to_csv(&sensorData,csv_line,sizeof(csv_line));
+
+      #ifdef DEBUG
+        Serial.println(csv_line);
+      #endif
+
+      save_csv_to_nvs(csv_line);
+      
+    }
+
     lastSensorReadTime = currentTime;
+  }
+
+  //used for data recollection + controls (simple CLI interface)
+  if(Serial.available()){
+    char input = Serial.read();
+
+    switch(input){
+      case 'r':
+      memset(csv_buffer, 0, sizeof(csv_buffer));
+      read_csv_from_nvs(csv_buffer,sizeof(csv_buffer));
+      Serial.println(csv_buffer);
+      break;
+      case 'c':
+      if(!clear_csv_from_nvs()){
+        Serial.println("Erased CSV data!");
+      }
+      save_csv_header();//add a new header
+      Serial.println("Header added");
+      break;
+      case 's':
+      toggleSensorLogging = false;
+      Serial.println("Stopped reading sensor readings");
+      break;
+    }
   }
 
 }
@@ -197,45 +145,6 @@ bool initQMI(void){
   //enable sensor to read gyro + acc
   qmi.enableGyroscope();
   qmi.enableAccelerometer();
-  return true;
-}
-
-bool calibrateQMI(){
-
-  for(int i = 0; i < CALIBRATIONSAMPLES; i++){
-    
-    //wait until data is ready
-    while(!qmi.getDataReady());
-    qmi.getAccelerometer(acc.x, acc.y, acc.z);
-    qmi.getGyroscope(gyro.x, gyro.y, gyro.z);
-
-    accCal.x += acc.x;
-    accCal.y += acc.y;
-    accCal.z += acc.z+1;
-    gyroCal.x += gyro.x;
-    gyroCal.y += gyro.y;
-    gyroCal.z += gyro.z;
-
-    delay(CALIBRATIONTIME/CALIBRATIONSAMPLES);
-  }
-  
-  accCal.x /= CALIBRATIONSAMPLES;
-  accCal.y /= CALIBRATIONSAMPLES;
-  accCal.z /= CALIBRATIONSAMPLES;
-  gyroCal.x /= CALIBRATIONSAMPLES;
-  gyroCal.y /= CALIBRATIONSAMPLES;
-  gyroCal.z /= CALIBRATIONSAMPLES;
-
-  #ifdef DEBUG
-    Serial.println("Calibration data: ");
-    Serial.printf("acc.x:%f g's\n",accCal.x);
-    Serial.printf("acc.y:%f g's\n",accCal.y);
-    Serial.printf("acc.z:%f g's\n",accCal.z);
-    Serial.printf("gyro.x:%f deg/s\n",gyroCal.x);
-    Serial.printf("gyro.y:%f deg/s\n",gyroCal.y);
-    Serial.printf("gyro.z:%f deg/s\n",gyroCal.z);
-  #endif 
-
   return true;
 }
 
@@ -341,32 +250,34 @@ bool readIMU(){
     return true;
   }
 
-  void printDataTFT(SensorData &data){
+  void printDataTFT(sensor_data_t &data){
     tft.fillScreen(ST77XX_BLACK);//clear the screen
     tft.setCursor(0,0);
     tft.print("Time: ");
-    tft.print((int)(data.timestamp/1000));
+    tft.print((data.timestamp/1000));
     tft.println(" secs");
     tft.print("Altitude: ");
     tft.print(data.altitude);
     tft.println(" m");
-    tft.print("acc.x: ");
-    tft.print(sensorData.acc.x);
-    tft.println(" g's");
-    tft.print("acc.y: ");
-    tft.print(sensorData.acc.y);
-    tft.println(" g's");
-    tft.print("acc.z: ");
-    tft.print(sensorData.acc.z);
+    tft.printf("acc mag: %.2f\n", sensorData.accMag);
+    tft.printf("velocity:%.2f\n",sensorData.velocity);
+    // tft.print("acc.x: ");
+    // tft.print(sensorData.acc.x);
+    // tft.println(" g's");
+    // tft.print("acc.y: ");
+    // tft.print(sensorData.acc.y);
+    // tft.println(" g's");
+    // tft.print("acc.z: ");
+    // tft.print(sensorData.acc.z);
     tft.println(" g's");
     tft.print("gyro.x: ");
-    tft.print(sensorData.gyro.x);
+    tft.print(sensorData.roll);
     tft.println(" deg");
     tft.print("gyro.y: ");
-    tft.print(sensorData.gyro.y);
+    tft.print(sensorData.pitch);
     tft.println(" deg");
     tft.print("gyro.z: ");
-    tft.print(sensorData.gyro.z);
+    tft.print(sensorData.yaw);
     tft.println(" deg");
     /*tft.print("Velocity: ");
     tft.print(velocity);
@@ -386,7 +297,167 @@ void kalman_1d(float kalmanState,float kalmanUncertainty,float kalmanInput,float
   kalman1DOutput[1] = kalmanUncertainty;
 }
 
+//function that calculated roll + pitch angles using accelerometer
 void calcAccAngles(){
   accAngles.x = atan(acc.y/sqrt(acc.x*acc.x+acc.z*acc.z))*1/(PI/180);
   accAngles.y = -atan(acc.x/sqrt(acc.y*acc.y+acc.z*acc.z))*1/(PI/180);
+}
+
+//function to initialise the nvs of esp32
+esp_err_t init_nvs(){
+  esp_err_t err = nvs_flash_init();
+  if(err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND){
+    ESP_ERROR_CHECK(nvs_flash_erase());//we erase contents if memory is used
+    err = nvs_flash_init();
+  }
+  ESP_ERROR_CHECK(err);
+  Serial.println("NVS initialised successfully");
+  return ESP_OK;
+}
+
+//function to save csv data to nvs memory
+esp_err_t save_csv_to_nvs(const char *csv_data){
+  nvs_handle_t nvs_handle;//handle for csv data location
+  esp_err_t err;
+
+  //open NVS in read & write mode
+  err = nvs_open(STORAGE_NAMESPACE, NVS_READWRITE, &nvs_handle);
+  if(err != ESP_OK){
+    Serial.printf("Error opening NVS handle: %s", esp_err_to_name(err));
+    return err;
+  }
+
+  //hold the information of the size of current csv data
+  size_t existing_size = 0;
+  err = nvs_get_blob(nvs_handle, CSV_KEY, NULL, &existing_size);
+
+  char *combined_data = NULL;
+
+  //if no errors occurred and there is data present
+  if(err == ESP_OK && existing_size > 0){
+    //apppend to existing data
+    combined_data = (char*)malloc(existing_size + strlen(csv_data) + 2);// +2 for new line and null terminator
+    if(combined_data == NULL){
+      nvs_close(nvs_handle);
+      return ESP_ERR_NO_MEM;
+    }
+
+    //read existing data
+    err = nvs_get_blob(nvs_handle, CSV_KEY, combined_data, &existing_size);
+    if(err != ESP_OK){
+      free(combined_data);
+      nvs_close(nvs_handle);
+      return err;
+    }
+
+    strcat(combined_data, "\n");
+    strcat(combined_data, csv_data);
+
+  }else{
+    
+    //first time saving or error reading existing data
+    combined_data = (char*)malloc(strlen(csv_data) + 1);
+    if(combined_data == NULL){
+      nvs_close(nvs_handle);
+      return ESP_ERR_NO_MEM;  
+    }
+
+  }
+
+  //save combined data
+  err = nvs_set_blob(nvs_handle, CSV_KEY, combined_data, strlen(combined_data) + 1);
+  if(err != ESP_OK){
+    Serial.printf("Error saving CSV data: %s\n", esp_err_to_name(err));
+    free(combined_data);
+    nvs_close(nvs_handle);
+    return err;
+  }
+
+  //commit combined data
+  err = nvs_commit(nvs_handle);
+  if(err != ESP_OK){
+    Serial.printf("Error saving CSV data: %s\n", esp_err_to_name(err));
+    free(combined_data);
+    nvs_close(nvs_handle);
+    return err;
+  }
+
+  Serial.printf("CSV data saved successfully\n");
+  free(combined_data);
+  nvs_close(nvs_handle);
+  return ESP_OK;
+
+} 
+
+//function to read saved data
+esp_err_t read_csv_from_nvs(char *csv_data, size_t max_size){
+  nvs_handle_t nvs_handle;
+  esp_err_t err;
+
+  //open NVS
+  err = nvs_open(STORAGE_NAMESPACE, NVS_READONLY, &nvs_handle);
+  if(err != ESP_OK){
+    Serial.printf("Error opening NVS handle: %s\n", esp_err_to_name(err));
+    return err;
+  }
+
+  //read CSV data
+  size_t required_size = max_size;
+  err = nvs_get_blob(nvs_handle, CSV_KEY, csv_data, &required_size);
+  if(err != ESP_OK){
+    if(err == ESP_ERR_NVS_NOT_FOUND){
+      Serial.printf("CSV data not found in NVS\n");
+    }else{
+      Serial.printf("Error reading CSV data: %s\n", esp_err_to_name(err));
+    }
+    nvs_close(nvs_handle);
+    return err;
+  }
+
+  Serial.printf("CSV data read successfully, size %d bytes\n", required_size);
+  nvs_close(nvs_handle);
+  return ESP_OK;
+}
+
+//function to clear csv data from nvs
+esp_err_t clear_csv_from_nvs(){
+  nvs_handle_t nvs_handle;
+  esp_err_t err;
+
+  err = nvs_open(STORAGE_NAMESPACE, NVS_READWRITE, &nvs_handle);
+  if(err != ESP_OK){
+    Serial.printf("Error opening NVS handle: %s\n", esp_err_to_name(err));
+    return err;
+  }
+
+  err = nvs_erase_key(nvs_handle, CSV_KEY);
+  if(err != ESP_OK){
+    Serial.printf("Error erasing CSV data: %s\n", esp_err_to_name(err));
+    nvs_close(nvs_handle);
+    return err;
+  }
+
+  err = nvs_commit(nvs_handle);
+  if(err != ESP_OK){
+    Serial.printf("Error commiting NVS: %s\n", esp_err_to_name(err));
+    nvs_close(nvs_handle);
+    return err;
+  }
+
+  Serial.printf("CSV data cleared successfully\n");
+  nvs_close(nvs_handle);
+  return ESP_OK;
+
+}
+
+//generates the text labels accociated with data inputs
+esp_err_t save_csv_header(){
+  char *header = "timestamp,altitude,accMag,vel,roll,pitch,yaw";
+  return save_csv_to_nvs(header);
+}
+
+//function to convert the sensor_data to string
+void sensor_data_to_csv(sensor_data_t *data, char *csv_string, size_t max_size){
+ snprintf(csv_string, max_size, "%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f",
+ currentTime,data->altitude,data->accMag,data->velocity,data->roll,data->pitch,data->yaw); 
 }
